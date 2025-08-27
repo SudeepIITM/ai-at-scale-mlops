@@ -1,140 +1,143 @@
-import os
-import json
-
-import mlflow
-import mlflow.spark
+import os, time, json
+import mlflow, mlflow.spark
+from mlflow.tracking import MlflowClient
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col
+from pyspark.sql.functions import col, when
 from pyspark.ml import Pipeline
-from pyspark.ml.feature import (
-    Imputer,
-    StringIndexer,
-    OneHotEncoder,
-    VectorAssembler
-)
+from pyspark.ml.feature import StringIndexer, OneHotEncoder, Imputer, VectorAssembler
 from pyspark.ml.classification import RandomForestClassifier
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
-from pyspark.ml.tuning import ParamGridBuilder, CrossValidator
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
 
+# Optional memory tracking on the driver
+try:
+    import psutil
+    HAVE_PSUTIL = True
+except Exception:
+    HAVE_PSUTIL = False
 
-# ---------- Spark ----------
-spark = (
-    SparkSession.builder
-    .appName("titanic-train-full-pipeline")
-    .config("spark.ui.showConsoleProgress", "false")
-    .getOrCreate()
-)
+EXPERIMENT_NAME = os.getenv("EXPERIMENT_NAME", "titanic-train-sweep")
+TRACKING_URI   = os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
 
-# ---------- Data ----------
-# Use the processed parquet produced by the preprocess stage
-df = spark.read.parquet("data/processed/train.parquet")
-
-# Ensure schema types (cast numerics to double to avoid assembler issues)
-num_cols = ["Pclass", "Age", "SibSp", "Parch", "Fare"]
-for c in num_cols:
-    df = df.withColumn(c, col(c).cast("double"))
-
-# These are the categorical columns we’ll encode
-cat_cols = ["Sex", "Embarked", "Pclass"]  # keep Pclass as categorical as well
-
-# ---------- Preprocess pipeline ----------
-# 1) Impute missing numeric values
-imputer = Imputer(
-    strategy="median",
-    inputCols=num_cols,
-    outputCols=[f"{c}_imp" for c in num_cols],
-)
-
-# 2) Index categoricals (keep unseen/invalid)
-indexers = [
-    StringIndexer(
-        inputCol=c,
-        outputCol=f"{c}_idx",
-        handleInvalid="keep"
+def build_spark():
+    # Let spark-submit pass resources; just set a reasonable shuffle default if not provided
+    return (
+        SparkSession.builder
+        .appName("titanic-train-full-pipeline")
+        .config("spark.sql.shuffle.partitions", os.getenv("SPARK_SHUFFLE_PARTITIONS", "200"))
+        .getOrCreate()
     )
-    for c in cat_cols
-]
 
-# 3) One-hot encode categoricals
-encoder = OneHotEncoder(
-    inputCols=[f"{c}_idx" for c in cat_cols],
-    outputCols=[f"{c}_oh" for c in cat_cols],
-    handleInvalid="keep"
-)
+def main():
+    t0 = time.time()
+    proc = psutil.Process() if HAVE_PSUTIL else None
+    rss_start = proc.memory_info().rss if proc else None
 
-# 4) Assemble features (keep rows even if something unexpected appears)
-feature_cols = [f"{c}_imp" for c in num_cols] + [f"{c}_oh" for c in cat_cols]
-assembler = VectorAssembler(
-    inputCols=feature_cols,
-    outputCol="features",
-    handleInvalid="keep"
-)
+    spark = build_spark()
+    sc = spark.sparkContext
+    conf = sc.getConf()
 
-# 5) Classifier
-rf = RandomForestClassifier(
-    featuresCol="features",
-    labelCol="Survived",
-    seed=42
-)
+    # ---------- Data ----------
+    df = (spark.read.option("header", True).option("inferSchema", True)
+          .csv("data/raw/train.csv"))
 
-pipeline = Pipeline(stages=[imputer] + indexers + [encoder, assembler, rf])
+    # Basic cleanup
+    df = df.withColumn("Sex", when(col("Sex") == "male", "male").otherwise("female"))
 
-# Train/valid split
-train_df, valid_df = df.randomSplit([0.8, 0.2], seed=42)
+    cat_cols = ["Sex", "Embarked", "Pclass"]
+    num_cols = ["Age", "SibSp", "Parch", "Fare"]
 
-# Small hyperparameter grid
-grid = (
-    ParamGridBuilder()
-    .addGrid(rf.numTrees, [50, 100])
-    .addGrid(rf.maxDepth, [5, 8])
-    .build()
-)
+    # ---------- Preprocess ----------
+    imputers = Imputer(strategy="median", inputCols=num_cols, outputCols=[c + "_imp" for c in num_cols])
+    indexers = [StringIndexer(handleInvalid="keep", inputCol=c, outputCol=c + "_idx") for c in cat_cols]
+    enc = OneHotEncoder(handleInvalid="keep",
+                        inputCols=[c + "_idx" for c in cat_cols],
+                        outputCols=[c + "_oh" for c in cat_cols])
 
-evaluator = BinaryClassificationEvaluator(
-    rawPredictionCol="rawPrediction",
-    labelCol="Survived",
-    metricName="areaUnderROC",
-)
+    feat_cols = [c + "_imp" for c in num_cols] + [c + "_oh" for c in cat_cols]
+    vec = VectorAssembler(inputCols=feat_cols, outputCol="features")
 
-cv = CrossValidator(
-    estimator=pipeline,
-    estimatorParamMaps=grid,
-    evaluator=evaluator,
-    numFolds=3,
-    parallelism=2,
-)
+    rf = RandomForestClassifier(featuresCol="features", labelCol="Survived", seed=42)
 
-# ---------- Fit ----------
-cv_model = cv.fit(train_df)
+    full_pipeline = Pipeline(stages=[imputers] + indexers + [enc, vec, rf])
 
-# ---------- Evaluate ----------
-val_auc = evaluator.evaluate(cv_model.transform(valid_df))
-print(f"Validation AUC: {val_auc:.6f}")
+    # Split
+    train_df, valid_df = df.randomSplit([0.8, 0.2], seed=42)
 
-# ---------- Save metrics for DVC ----------
-with open("metrics.json", "w") as f:
-    json.dump({"val_auc": float(val_auc)}, f)
-print("✅ Wrote metrics.json")
+    # Small grid
+    grid = (ParamGridBuilder()
+            .addGrid(rf.numTrees, [50, 100])
+            .addGrid(rf.maxDepth, [5, 8])
+            .build())
 
-# ---------- Save fitted PipelineModel so DVC out 'models/spark_model' is produced ----------
-out_path = "models/spark_model"
-# overwrite OK so `dvc repro` is idempotent
-cv_model.bestModel.write().overwrite().save(out_path)
-print(f"✅ Saved fitted PipelineModel to {out_path}")
-
-# ---------- (Optional) Log to MLflow ----------
-mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000"))
-mlflow.set_experiment("titanic-train")
-
-with mlflow.start_run() as run:
-    mlflow.log_metric("val_auc", float(val_auc))
-    # Log full Spark model (optional but nice)
-    mlflow.spark.log_model(
-        spark_model=cv_model.bestModel,
-        artifact_path="model",
-        registered_model_name="titanic_rf"
+    evaluator = BinaryClassificationEvaluator(
+        rawPredictionCol="rawPrediction",
+        labelCol="Survived",
+        metricName="areaUnderROC"
     )
-    print(f"🧪 MLflow run_id: {run.info.run_id}")
 
-spark.stop()
+    cv = CrossValidator(
+        estimator=full_pipeline,
+        estimatorParamMaps=grid,
+        evaluator=evaluator,
+        numFolds=3,
+        parallelism=int(os.getenv("CV_PARALLELISM", "2"))
+    )
+
+    # ---------- Train ----------
+    mlflow.set_tracking_uri(TRACKING_URI)
+    mlflow.set_experiment(EXPERIMENT_NAME)
+
+    with mlflow.start_run() as run:
+        # Log Spark resource settings (what we are sweeping)
+        params = {
+            "spark.executor.instances": conf.get("spark.executor.instances", "N/A"),
+            "spark.executor.cores":     conf.get("spark.executor.cores",     "N/A"),
+            "spark.executor.memory":    conf.get("spark.executor.memory",    "N/A"),
+            "spark.driver.memory":      conf.get("spark.driver.memory",      "N/A"),
+            "spark.sql.shuffle.partitions": conf.get("spark.sql.shuffle.partitions", "N/A"),
+            "cv_parallelism": os.getenv("CV_PARALLELISM", "2"),
+        }
+        for k, v in params.items():
+            mlflow.log_param(k, v)
+
+        model = cv.fit(train_df)
+        val_auc = evaluator.evaluate(model.transform(valid_df))
+        mlflow.log_metric("val_auc", float(val_auc))
+
+        # timing + memory
+        runtime_s = time.time() - t0
+        mlflow.log_metric("runtime_seconds", runtime_s)
+
+        if HAVE_PSUTIL:
+            rss_end = psutil.Process().memory_info().rss
+            mlflow.log_metric("driver_rss_start_mb", rss_start / 1e6 if rss_start else 0.0)
+            mlflow.log_metric("driver_rss_end_mb",   rss_end / 1e6)
+        # Log configured executor memory so you have a memory axis in reports
+        mlflow.log_param("cfg_executor_memory_mb",
+                         _mem_to_mb(conf.get("spark.executor.memory", "N/A")))
+
+        # Log model (whole pipeline)
+        mlflow.spark.log_model(
+            spark_model=model.bestModel,
+            artifact_path="model",
+        )
+
+        print(f"Validation AUC: {val_auc:.4f} | runtime: {runtime_s:.1f}s")
+    spark.stop()
+
+def _mem_to_mb(s):
+    # Accept "2g", "4096m", "N/A"
+    s = str(s).lower()
+    try:
+        if s.endswith("g"):
+            return int(float(s[:-1]) * 1024)
+        if s.endswith("m"):
+            return int(float(s[:-1]))
+        return int(s)
+    except Exception:
+        return -1
+
+if __name__ == "__main__":
+    main()

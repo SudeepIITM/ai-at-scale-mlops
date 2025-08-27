@@ -1,0 +1,9 @@
+stages:
+  preprocess:
+    cmd: python src/pipeline/01_preprocess_spark.py
+    deps:
+      - src/pipeline/01_preprocess_spark.py
+      - data/raw/train.csv
+    outs:
+      - data/processed/train.parquet
+    # remove the valid.parquet line if you don't produce it

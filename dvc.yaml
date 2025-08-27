@@ -6,4 +6,28 @@ stages:
       - data/raw/train.csv
     outs:
       - data/processed/train.parquet
-    # remove the valid.parquet line if you don't produce it
+
+  train:
+    cmd: python src/models/02_train_spark.py
+    deps:
+      - src/models/02_train_spark.py
+      - data/processed/train.parquet
+    outs:
+      - models/spark_model
+    metrics:
+      - metrics.json
+
+  register:
+    cmd: python src/models/03_register.py
+    deps:
+      - src/models/03_register.py
+      - models/spark_model
+
+  drift-monitor:
+    cmd: python src/pipeline/05_drift_monitor.py
+    deps:
+      - src/pipeline/05_drift_monitor.py
+      - artifacts/baseline_stats.json
+      - data/raw/new_batch.csv
+    outs:
+      - artifacts/drift_report.json

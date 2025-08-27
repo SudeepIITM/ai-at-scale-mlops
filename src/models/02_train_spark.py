@@ -28,6 +28,13 @@ preds = model.transform(test)
 evaluator = BinaryClassificationEvaluator(labelCol="Survived", metricName="areaUnderROC")
 auc = evaluator.evaluate(preds)
 print("Validation AUC:", auc)
+# --- Save metrics for DVC ---
+import json, os
+with open("metrics.json", "w") as f:
+    json.dump({"val_auc": float(val_auc)}, f)
+print("✅ Wrote metrics.json")
+O
+
 
 mlflow.set_tracking_uri("http://127.0.0.1:5000")
 mlflow.set_experiment("titanic-train")

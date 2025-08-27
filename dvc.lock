@@ -1,0 +1,19 @@
+schema: '2.0'
+stages:
+  preprocess:
+    cmd: python src/pipeline/01_preprocess_spark.py
+    deps:
+    - path: data/raw/train.csv
+      hash: md5
+      md5: 2309cc5f04782ed9bb6016d9f4e381cf
+      size: 61194
+    - path: src/pipeline/01_preprocess_spark.py
+      hash: md5
+      md5: 50acc931229fea040a971ad3629289b1
+      size: 1919
+    outs:
+    - path: data/processed/train.parquet
+      hash: md5
+      md5: 4425aec7e078c605f3e2832cbf48a85f.dir
+      size: 12039
+      nfiles: 4
